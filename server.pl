@@ -14,6 +14,7 @@ use JSON::XS;
 use Math::Trig;
 
 use Data::Dumper;
+use Time::HiRes;
 
 $AnyEvent::HTTP::MAX_PER_HOST = 1;
 $AnyEvent::Log::FILTER->level('trace');
@@ -45,17 +46,14 @@ sub connection_destroy {
 my %last_coordinates = ();
 my %last_updated_coordinates = ();
 
-sub process_route_data {
-        my $data = shift;
-        # print Dumper($data), "\n\n";
+sub process_vehicles {
+        my $vehicles = shift;
 
-        my $vehicles = $data->{ts};
-
-        if (UNIVERSAL::isa($vehicles, 'HASH')) {
-                foreach my $vehicle_id (keys %$vehicles) {
-                        my $vehicle = $vehicles->{$vehicle_id};
+        if (UNIVERSAL::isa($vehicles, 'ARRAY')) {
+                foreach my $vehicle (@$vehicles) {
 
                         next unless UNIVERSAL::isa($vehicle, 'HASH');
+                        my $vehicle_id = $vehicle->{'u_id'};
 
                         $vehicle->{u_course} = 0;
 
@@ -81,7 +79,7 @@ sub process_route_data {
                 }
         }
 
-        return $data;
+        return $vehicles;
 }
 
 sub calculate_course {
@@ -118,18 +116,27 @@ sub handler_get_route {
         }
 
         $connections{$handle}{route_id} = \%new_route_id;
-        $handle->push_write( sprintf( "get_route ok: %s\015\012", join( ',', keys %new_route_id ) ) );
+
+        $handle->push_write("[");
 
         unless ($connections{$handle}{w_sender}) {
                 $connections{$handle}{w_sender} = AnyEvent->timer(after => 1, interval => 3, cb => sub {
-                        my %data;
+                        my $trx_id = substr(Time::HiRes::time * 100000, 8) + 0;
                         my %route_id = %{ $connections{$handle}{route_id} //= {} };
+
                         foreach ( keys %route_id ) {
-                                next if not exists $route{$_} or not UNIVERSAL::isa($route{$_}, 'HASH');
-                                $data{$_} = process_route_data($route{$_});
+                                my $vehicles = exists $route{$_} ? $route{$_} : [];                             
+
+                                my $route = {
+                                        trx_id => $trx_id, 
+                                        route_id => $_ + 0, 
+                                        vehicles => $vehicles,
+                                };
+
+                                my $json = encode_json($route);
+                                $handle->push_write( $json . "," )
                         }
 
-                        $handle->push_write( encode_json(\%data) . "\015\012" );
                 });
         }
 }
@@ -225,7 +232,7 @@ sub make_session_request {
             method => 'startSession',
             params => {},
         });
-        
+
         http_post
                 'http://transport.volganet.ru/api/rpc.php',
                 $body,
@@ -268,7 +275,7 @@ sub make_api_request {
                 marshList => $route_id
             },
         });
-        
+
         my $req = http_post
                 'http://transport.volganet.ru/api/rpc.php',
                 $body,
@@ -291,11 +298,11 @@ sub session_request_periodic {
                         if ($hdr->{Status} =~ /^2/) {
                                 my $response = decode_json( $data );
                                 # {"jsonrpc":"2.0","result":{"sid":"E5B92E2E-A691-413A-A049-5B732B6E0C75"},"id":1}
-                                
-				if ( UNIVERSAL::isa( $response, 'HASH' ) && UNIVERSAL::isa( $response->{'result'}, 'HASH' ) ) {
+
+                                if ( UNIVERSAL::isa( $response, 'HASH' ) && UNIVERSAL::isa( $response->{'result'}, 'HASH' ) ) {
                                         $sid = $response->{'result'}->{'sid'};
-                                	AE::log info => "Got session OK (sid: $sid)";
-				} else {
+                                        AE::log info => "Got session OK (sid: $sid)";
+                                } else {
                                         $sid = undef;
                                         AE::log error => "Got session ERROR, bad response format";
                                 }
@@ -320,7 +327,7 @@ sub poll_needed_route {
                     AE::log info => "No routes are needed, skipping request";
                     return;
                 }
-                
+
                 my @route_ids = keys %need_route;
                 my $request_key = join(',', sort @route_ids);
 
@@ -357,17 +364,24 @@ sub _fill_route {
 
         my $response = decode_json( $data );
         if ( UNIVERSAL::isa( $response, 'HASH' ) && UNIVERSAL::isa( $response->{'result'}, 'ARRAY' ) ) {
-		my %requested_route_ids;
+
+                my %requested_route_ids;
                 @requested_route_ids{ @$requested_route_ids } = (undef) x @$requested_route_ids;
-		
-		use Data::Dumper;
-                AE::log info => Dumper($response);
-		
-		foreach my $r ( @{ $response->{result} } ) {
+
+                my $response_result = $response->{result};
+
+                foreach my $r ( @$response_result ) {
                         my $route_id = $r->{'mr_id'};
                         next unless $route_id;
 
-                        push @{ $route{$route_id} ||= [] } => $r;
+                        $route{$route_id} = [];
+                }
+
+                foreach my $r ( @$response_result ) {
+                        my $route_id = $r->{'mr_id'};
+                        next unless $route_id;
+
+                        push @{ $route{$route_id} } => $r;
                         delete $requested_route_ids{$route_id};
                 }
 
@@ -386,5 +400,3 @@ session_request_periodic();
 poll_needed_route();
 
 $cv->recv;
-
-
