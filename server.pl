@@ -22,6 +22,7 @@ $AnyEvent::Log::FILTER->level('trace');
 use constant API_POLL_PERIOD => 1;
 use constant SESSION_POLL_PERIOD => 20;
 use constant POLL_TIME_PERIOD_EMPTY => 1 * 5 * 60; # in secs
+use constant KILOMETER_RHO => 6371.64;
 
 my $host = undef;
 my $port = 44244;
@@ -53,8 +54,8 @@ sub process_vehicles {
                 foreach my $vehicle (@$vehicles) {
 
                         next unless UNIVERSAL::isa($vehicle, 'HASH');
-                        my $vehicle_id = $vehicle->{'u_id'};
-
+			my $vehicle_id = $vehicle->{'u_id'};
+			
                         $vehicle->{u_course} = 0;
 
                         unless (exists $last_updated_coordinates{$vehicle_id}) {
@@ -94,8 +95,25 @@ sub calculate_course {
         return (atan2($y, $x) * (180 / pi) + 360) % 360;
 }
 
+sub distance {
+    my ($lat1, $lon1, $lat2, $lon2) = @_;
+ 
+    $lon1 = deg2rad($lon1);
+    $lat1 = deg2rad($lat1);
+    $lon2 = deg2rad($lon2);
+    $lat2 = deg2rad($lat2);
+ 
+    my $dlon = $lon2 - $lon1;
+    my $dlat = $lat2 - $lat1;
+    my $a = (sin($dlat / 2)) ** 2 + cos($lat1) * cos($lat2) * (sin($dlon / 2)) ** 2;
+    my $c = 2 * atan2(sqrt($a), sqrt(abs(1 - $a)));
+ 
+    return KILOMETER_RHO * $c;
+}
+
+
 sub handler_get_route {
-        my ($handle, $new_route_id) = @_;
+        my ($handle, $new_route_id, $_filter) = @_;
 
         my %new_route_id; @new_route_id{ @$new_route_id } = (undef) x @$new_route_id;
         my %cur_route_id = %{ $connections{$handle}{route_id} //= {} };
@@ -116,29 +134,54 @@ sub handler_get_route {
         }
 
         $connections{$handle}{route_id} = \%new_route_id;
-
-        $handle->push_write("[");
+        $connections{$handle}{filter} = $_filter;
+	
+	$handle->push_write("[");
 
         unless ($connections{$handle}{w_sender}) {
                 $connections{$handle}{w_sender} = AnyEvent->timer(after => 1, interval => 3, cb => sub {
                         my $trx_id = substr(Time::HiRes::time * 100000, 8) + 0;
-                        my %route_id = %{ $connections{$handle}{route_id} //= {} };
+      			my %route_id = %{ $connections{$handle}{route_id} //= {} };
+                        my $filter = $connections{$handle}{filter};
 
-                        foreach ( keys %route_id ) {
-                                my $vehicles = exists $route{$_} ? $route{$_} : [];                             
-
+			foreach ( keys %route_id ) {
+				my $vehicles = exists $route{$_} ? $route{$_} : [];			
+                                $vehicles = apply_filter($vehicles, $filter);
+                                
                                 my $route = {
-                                        trx_id => $trx_id, 
+					trx_id => $trx_id, 
                                         route_id => $_ + 0, 
                                         vehicles => $vehicles,
                                 };
-
-                                my $json = encode_json($route);
+				
+				my $json = encode_json($route);
                                 $handle->push_write( $json . "," )
-                        }
-
+			}
                 });
         }
+}
+
+sub apply_filter {
+        my ($vehicles, $filter) = @_;
+        unless (UNIVERSAL::isa($filter, 'HASH')) {
+                return $vehicles;                
+        }
+
+        my $center = $filter->{center};
+        unless (UNIVERSAL::isa($center, 'HASH')) {
+                return $vehicles;                
+        }
+
+        my @filtered;
+        foreach my $vehicle (@$vehicles) {
+                my $distance = distance($center->{lat}, $center->{long}, $vehicle->{u_lat}, $vehicle->{u_long});
+                if ($distance <= $filter->{radius}) {
+                        $vehicle->{distance} = $distance;
+                        push @filtered => $vehicle;
+                }
+        }
+
+        return \@filtered;
 }
 
 sub handler_dump_route_data {
@@ -169,10 +212,20 @@ tcp_server( $host, $port, sub {
 
                         AE::log info => sprintf("Received (cmd: %s, args: %s)\n", $cmd, $arg);
 
-                        if ($cmd =~ /^get_route|dump_route$/) {
-                                my @route_id = grep { defined && /^\d+$/ } split(/,/, $arg);
+                        if ($cmd =~ /^get_route|dump_route|get_route_in_radius$/) {
+                                my ($arg1, $arg2, $arg3) = split(/\s/, $arg);
+                                my @route_id = grep { defined && /^\d+$/ } split(/,/, $arg1);
+
                                 if ($cmd eq 'get_route') {
-                                        handler_get_route($handle, \@route_id);
+                                        handler_get_route($handle, \@route_id, undef);
+                                } elsif ($cmd eq 'get_route_in_radius') {
+                                        my ($from_lat, $from_lng) = split(/,/, $arg2);
+                                        my %filter = (
+                                                radius => $arg3,
+                                                center => { lat => $from_lat, long => $from_lng },
+                                        );
+
+                                        handler_get_route($handle, \@route_id, \%filter);
                                 } elsif ($cmd eq 'dump_route') {
                                         handler_dump_route_data($handle, \@route_id);
                                 }
@@ -194,6 +247,7 @@ tcp_server( $host, $port, sub {
         $connections{$handle} = {
                 handle   => $handle,
                 route_id => {},
+                filter => undef,
                 w_sender => undef,
         };
 
@@ -232,7 +286,7 @@ sub make_session_request {
             method => 'startSession',
             params => {},
         });
-
+        
         http_post
                 'http://transport.volganet.ru/api/rpc.php',
                 $body,
@@ -275,7 +329,7 @@ sub make_api_request {
                 marshList => $route_id
             },
         });
-
+        
         my $req = http_post
                 'http://transport.volganet.ru/api/rpc.php',
                 $body,
@@ -298,11 +352,11 @@ sub session_request_periodic {
                         if ($hdr->{Status} =~ /^2/) {
                                 my $response = decode_json( $data );
                                 # {"jsonrpc":"2.0","result":{"sid":"E5B92E2E-A691-413A-A049-5B732B6E0C75"},"id":1}
-
-                                if ( UNIVERSAL::isa( $response, 'HASH' ) && UNIVERSAL::isa( $response->{'result'}, 'HASH' ) ) {
+                                
+				if ( UNIVERSAL::isa( $response, 'HASH' ) && UNIVERSAL::isa( $response->{'result'}, 'HASH' ) ) {
                                         $sid = $response->{'result'}->{'sid'};
-                                        AE::log info => "Got session OK (sid: $sid)";
-                                } else {
+                                	AE::log info => "Got session OK (sid: $sid)";
+				} else {
                                         $sid = undef;
                                         AE::log error => "Got session ERROR, bad response format";
                                 }
@@ -327,7 +381,7 @@ sub poll_needed_route {
                     AE::log info => "No routes are needed, skipping request";
                     return;
                 }
-
+                
                 my @route_ids = keys %need_route;
                 my $request_key = join(',', sort @route_ids);
 
@@ -364,20 +418,20 @@ sub _fill_route {
 
         my $response = decode_json( $data );
         if ( UNIVERSAL::isa( $response, 'HASH' ) && UNIVERSAL::isa( $response->{'result'}, 'ARRAY' ) ) {
-
-                my %requested_route_ids;
+                
+		my %requested_route_ids;
                 @requested_route_ids{ @$requested_route_ids } = (undef) x @$requested_route_ids;
+		
+		my $response_result = $response->{result};
 
-                my $response_result = $response->{result};
-
-                foreach my $r ( @$response_result ) {
-                        my $route_id = $r->{'mr_id'};
+		foreach my $r ( @$response_result ) {
+			my $route_id = $r->{'mr_id'};
                         next unless $route_id;
+			
+			$route{$route_id} = [];
+		}
 
-                        $route{$route_id} = [];
-                }
-
-                foreach my $r ( @$response_result ) {
+		foreach my $r ( @$response_result ) {
                         my $route_id = $r->{'mr_id'};
                         next unless $route_id;
 
